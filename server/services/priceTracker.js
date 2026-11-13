@@ -1,27 +1,31 @@
 
 const db = require("../db");
-const lebtech = require("./lebtech");
+const electronics = require("./lebtech");
 
-const ID_PATTERN =
+const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const VALID_CATEGORIES = new Set([
+const ALLOWED = new Set([
   "electronics",
   "computers-accessories"
 ]);
 
-function asText(value, max = 255) {
+const pending = new Map();
+
+let blockedUntil = 0;
+let consecutiveLimits = 0;
+
+function clean(value, max = 255) {
   return typeof value === "string"
     ? value.trim().slice(0, max)
     : "";
 }
 
-function safeUrl(value) {
+function safeURL(value) {
   try {
     const url = new URL(value);
 
-    return url.protocol === "https:" ||
-      url.protocol === "http:"
+    return ["https:", "http:"].includes(url.protocol)
       ? url.href
       : null;
   } catch {
@@ -29,7 +33,7 @@ function safeUrl(value) {
   }
 }
 
-function money(value) {
+function toPrice(value) {
   if (
     value === null ||
     value === undefined ||
@@ -38,39 +42,81 @@ function money(value) {
     return null;
   }
 
-  const n = Number(value);
+  const number = Number(value);
 
-  return Number.isFinite(n) &&
-    n >= 0 &&
-    n <= 9999999999
-    ? n.toFixed(2)
+  return Number.isFinite(number) &&
+    number >= 0 &&
+    number <= 9999999999
+    ? number.toFixed(2)
     : null;
 }
 
 // =====================================
-// NORMALIZE AND DEDUPLICATE OFFERS
+// DETECT RATE LIMITING
+// =====================================
+
+function isRateLimited(error) {
+  return (
+    Number(error?.code || error?.status) === 429 ||
+    /(?:\b429\b|error.?1015|rate.?limit)/i.test(
+      String(error?.message || "")
+    )
+  );
+}
+
+function startCooldown(error) {
+  consecutiveLimits++;
+
+  const reported = Number(
+    String(error?.message || "").match(
+      /"retry_after"\s*:\s*(\d+)/
+    )?.[1] || 30
+  );
+
+  const exponentialSeconds = Math.min(
+    600,
+    30 * 2 ** Math.min(consecutiveLimits - 1, 5)
+  );
+
+  const waitSeconds = Math.max(
+    30,
+    reported,
+    exponentialSeconds
+  );
+
+  blockedUntil = Date.now() + waitSeconds * 1000;
+
+  console.warn(
+    `Price requests paused for ${waitSeconds} seconds due to rate limiting.`
+  );
+
+  return waitSeconds;
+}
+
+// =====================================
+// NORMALIZE STORE OFFERS
 // =====================================
 
 function normalizeOffers(rawOffers) {
   const unique = new Map();
 
   for (const item of rawOffers) {
-    const storeName = asText(item.storeName);
-    const amount = money(item.price);
+    const storeName = clean(item.storeName);
+    const amount = toPrice(item.price);
 
     if (
       !storeName ||
-      storeName === "Unknown store" ||
+      storeName.toLowerCase() === "unknown store" ||
       amount === null
     ) {
       continue;
     }
 
     const condition =
-      asText(item.condition, 50) || "New";
+      clean(item.condition, 50) || "New";
 
     const currency =
-      asText(item.currency, 10).toUpperCase() || "USD";
+      clean(item.currency, 10).toUpperCase() || "USD";
 
     const availability =
       typeof item.availability === "boolean"
@@ -79,15 +125,14 @@ function normalizeOffers(rawOffers) {
               ? "In stock"
               : "Out of stock"
           )
-        : (
-            asText(item.availability, 50) || "Unknown"
-          );
+        : clean(item.availability, 50) || "Unknown";
 
-    const link = safeUrl(item.url);
-    const date = new Date(item.checkedAt || Date.now());
+    const parsedTime = Date.parse(
+      item.checkedAt || ""
+    );
 
-    const checkedAt = Number.isFinite(date.getTime())
-      ? date.toISOString()
+    const checkedAt = Number.isFinite(parsedTime)
+      ? new Date(parsedTime).toISOString()
       : new Date().toISOString();
 
     const offer = {
@@ -96,12 +141,10 @@ function normalizeOffers(rawOffers) {
       condition,
       currency,
       availability,
-      link,
+      url: safeURL(item.url),
       checkedAt
     };
 
-    // Keep the lowest reported price for each
-    // store and condition of this exact product.
     const key =
       `${storeName.toLowerCase()}|${condition.toLowerCase()}`;
 
@@ -119,7 +162,7 @@ function normalizeOffers(rawOffers) {
 }
 
 // =====================================
-// GET SAVED PRICE HISTORY
+// READ SAVED PRICE HISTORY
 // =====================================
 
 async function getProductHistory(productId) {
@@ -145,9 +188,7 @@ async function getProductHistory(productId) {
     LEFT JOIN public.stores s
       ON s.id = o.store_id
     WHERE o.product_id = $1
-    ORDER BY
-      h.recorded_at DESC,
-      h.id DESC
+    ORDER BY h.recorded_at DESC, h.id DESC
     LIMIT 100
     `,
     [productId]
@@ -157,32 +198,115 @@ async function getProductHistory(productId) {
 }
 
 // =====================================
-// FETCH, SAVE AND TRACK STORE PRICES
+// USE PREVIOUSLY SAVED PRICES
 // =====================================
 
-async function trackProduct(product, categorySlug) {
-  const externalId = asText(product?.externalId, 100);
-  const name = asText(product?.name, 500);
+async function savedSnapshot(externalId, reason) {
+  const matched = await db.pool.query(
+    `
+    SELECT id
+    FROM public.products
+    WHERE source_name = 'LebTech'
+      AND external_id = $1
+    ORDER BY id
+    LIMIT 1
+    `,
+    [externalId]
+  );
 
-  if (
-    !ID_PATTERN.test(externalId) ||
-    !name ||
-    !VALID_CATEGORIES.has(categorySlug)
-  ) {
-    const error = new Error(
-      "Invalid product details or category"
-    );
+  const productId = matched.rows[0]?.id || null;
 
-    error.status = 400;
-    throw error;
+  if (!productId) {
+    return {
+      productId: null,
+      offers: [],
+      history: [],
+      stats: null,
+      warning:
+        `${reason} No previously saved offers exist for this product yet.`,
+      fromSavedData: true
+    };
   }
 
-  // The backend retrieves the actual prices.
-  // The browser cannot supply retailer prices.
-  const liveOffers =
-    await lebtech.getProductPrices(externalId);
+  const saved = await db.pool.query(
+    `
+    SELECT
+      s.name AS "storeName",
+      o.price,
+      o.currency,
+      o."condition" AS condition,
+      o.availability,
+      o.product_url AS url,
+      o.last_checked_at AS "checkedAt"
+    FROM public.offers o
+    LEFT JOIN public.stores s
+      ON s.id = o.store_id
+    WHERE o.product_id = $1
+      AND o.price IS NOT NULL
+    ORDER BY o.price ASC
+    `,
+    [productId]
+  );
+
+  return {
+    productId,
+    offers: saved.rows,
+    history: await getProductHistory(productId),
+    stats: null,
+    warning: saved.rows.length
+      ? `${reason} Showing previously saved prices, which may be outdated.`
+      : `${reason} No previously saved offers exist for this product yet.`,
+    fromSavedData: true
+  };
+}
+
+// =====================================
+// FETCH AND TRACK LIVE PRICES
+// =====================================
+
+async function performTracking(
+  product,
+  categorySlug,
+  externalId,
+  name
+) {
+  let liveOffers;
+
+  try {
+    liveOffers =
+      await electronics.getProductPrices(externalId);
+
+    blockedUntil = 0;
+    consecutiveLimits = 0;
+
+  } catch (error) {
+    if (!isRateLimited(error)) {
+      throw error;
+    }
+
+    const wait = startCooldown(error);
+
+    return savedSnapshot(
+      externalId,
+      `Live prices are temporarily rate limited. Retry in at least ${wait} seconds.`
+    );
+  }
+
+  if (!Array.isArray(liveOffers)) {
+    throw new Error(
+      "Pricing service returned an unexpected response"
+    );
+  }
 
   const validOffers = normalizeOffers(liveOffers);
+
+  if (validOffers.length === 0) {
+    return savedSnapshot(
+      externalId,
+      "No usable live store offers were returned."
+    );
+  }
+
   const client = await db.pool.connect();
 
   let productId;
@@ -191,13 +315,14 @@ async function trackProduct(product, categorySlug) {
     newOffers: 0,
     priceChanges: 0,
     unchangedOffers: 0,
-    skippedOffers: liveOffers.length - validOffers.length
+    skippedOffers:
+      liveOffers.length - validOffers.length,
+    offersTracked: validOffers.length
   };
 
   try {
     await client.query("BEGIN");
 
-    // Prevent duplicate inserts from simultaneous checks.
     await client.query(
       `
       SELECT pg_advisory_xact_lock(
@@ -219,24 +344,28 @@ async function trackProduct(product, categorySlug) {
     );
 
     if (!category.rows.length) {
-      throw new Error("Product category is missing");
+      throw new Error(
+        "Product category is missing from PostgreSQL"
+      );
     }
 
-    // =====================================
-    // ENSURE DATA SOURCE EXISTS
-    // =====================================
+    // DATA SOURCE
 
     const source = await client.query(
       `
       INSERT INTO public.data_sources
-        (name, source_type, description, base_url)
-      VALUES
         (
-          'LebTech',
-          'MCP',
-          'Lebanese retailer product prices',
-          'https://lebtechlb.com/api/mcp'
+          name,
+          source_type,
+          description,
+          base_url
         )
+      VALUES (
+        'LebTech',
+        'MCP',
+        'Lebanese retailer prices',
+        'https://lebtechlb.com/api/mcp'
+      )
       ON CONFLICT (name)
       DO UPDATE SET is_active = TRUE
       RETURNING id
@@ -245,12 +374,11 @@ async function trackProduct(product, categorySlug) {
 
     const sourceId = source.rows[0].id;
 
-    // =====================================
-    // SAVE BRAND IF AVAILABLE
-    // =====================================
+    // BRAND
 
     let brandId = null;
-    const brandName = asText(product.brand);
+
+    const brandName = clean(product.brand);
 
     if (brandName) {
       const brand = await client.query(
@@ -267,9 +395,7 @@ async function trackProduct(product, categorySlug) {
       brandId = brand.rows[0].id;
     }
 
-    // =====================================
-    // SAVE OR UPDATE PRODUCT
-    // =====================================
+    // PRODUCT
 
     const existing = await client.query(
       `
@@ -292,18 +418,20 @@ async function trackProduct(product, categorySlug) {
         UPDATE public.products
         SET
           name = $2,
-          brand_id = COALESCE($3, brand_id),
-          image_url = COALESCE($4, image_url),
-          product_url = COALESCE($5, product_url),
+          category_id = $3,
+          brand_id = COALESCE($4, brand_id),
+          image_url = COALESCE($5, image_url),
+          product_url = COALESCE($6, product_url),
           updated_at = NOW()
         WHERE id = $1
         `,
         [
           productId,
           name,
+          category.rows[0].id,
           brandId,
-          safeUrl(product.image),
-          safeUrl(product.productUrl)
+          safeURL(product.image),
+          safeURL(product.productUrl)
         ]
       );
     } else {
@@ -321,38 +449,35 @@ async function trackProduct(product, categorySlug) {
             external_id,
             product_url
           )
-        VALUES
-          (
-            $1, $2, $3, $4, $5::jsonb,
-            'external', 'LebTech', $6, $7
-          )
+        VALUES (
+          $1, $2, $3, $4, $5::jsonb,
+          'external', 'LebTech', $6, $7
+        )
         RETURNING id
         `,
         [
           name,
           brandId,
           category.rows[0].id,
-          safeUrl(product.image),
+          safeURL(product.image),
           JSON.stringify({
             catalogCategory:
-              asText(product.category, 100) || null,
+              clean(product.category, 100) || null,
             market: "Lebanon"
           }),
           externalId,
-          safeUrl(product.productUrl)
+          safeURL(product.productUrl)
         ]
       );
 
       productId = inserted.rows[0].id;
     }
 
-    // =====================================
-    // SAVE EACH RETAILER OFFER
-    // =====================================
+    // STORE OFFERS
 
     for (const offer of validOffers) {
-      const storeSite = offer.link
-        ? new URL(offer.link).origin
+      const website = offer.url
+        ? new URL(offer.url).origin
         : null;
 
       const store = await client.query(
@@ -368,12 +493,15 @@ async function trackProduct(product, categorySlug) {
           )
         RETURNING id
         `,
-        [offer.storeName, storeSite]
+        [offer.storeName, website]
       );
 
       const previous = await client.query(
         `
-        SELECT id, price, currency
+        SELECT
+          id,
+          price,
+          currency
         FROM public.offers
         WHERE product_id = $1
           AND store_id = $2
@@ -391,16 +519,16 @@ async function trackProduct(product, categorySlug) {
       );
 
       let offerId;
-      let changed = false;
+      let changed;
 
       if (previous.rows.length) {
-        const row = previous.rows[0];
-        offerId = row.id;
+        const prior = previous.rows[0];
+        offerId = prior.id;
 
         changed =
-          row.price === null ||
-          Number(row.price).toFixed(2) !== offer.amount ||
-          row.currency !== offer.currency;
+          prior.price === null ||
+          Number(prior.price).toFixed(2) !== offer.amount ||
+          prior.currency !== offer.currency;
 
         await client.query(
           `
@@ -424,7 +552,7 @@ async function trackProduct(product, categorySlug) {
             offer.currency,
             offer.condition,
             offer.availability,
-            offer.link,
+            offer.url,
             offer.checkedAt,
             sourceId
           ]
@@ -450,11 +578,10 @@ async function trackProduct(product, categorySlug) {
               product_url,
               last_checked_at
             )
-          VALUES
-            (
-              $1, $2, $3, $4, $5,
-              $6, $7, $8, $9
-            )
+          VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9
+          )
           RETURNING id
           `,
           [
@@ -465,18 +592,19 @@ async function trackProduct(product, categorySlug) {
             offer.currency,
             offer.condition,
             offer.availability,
-            offer.link,
+            offer.url,
             offer.checkedAt
           ]
         );
 
         offerId = inserted.rows[0].id;
+
         changed = true;
         stats.newOffers++;
       }
 
-      // Only record a new observation when
-      // the price is new or has changed.
+      // RECORD ONLY NEW OR CHANGED PRICES
+
       if (changed) {
         await client.query(
           `
@@ -494,6 +622,7 @@ async function trackProduct(product, categorySlug) {
     }
 
     await client.query("COMMIT");
+
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -501,17 +630,72 @@ async function trackProduct(product, categorySlug) {
     client.release();
   }
 
-  const history = await getProductHistory(productId);
-
   return {
     productId,
     offers: liveOffers,
-    history,
-    stats: {
-      ...stats,
-      offersTracked: validOffers.length
-    }
+    history: await getProductHistory(productId),
+    stats,
+    warning: "",
+    fromSavedData: false
   };
+}
+
+// =====================================
+// RATE-LIMIT-SAFE ENTRY POINT
+// =====================================
+
+async function trackProduct(product, categorySlug) {
+  const externalId = clean(
+    product?.externalId,
+    100
+  );
+
+  const name = clean(product?.name, 500);
+
+  if (
+    !UUID.test(externalId) ||
+    !name ||
+    !ALLOWED.has(categorySlug)
+  ) {
+    const error = new Error(
+      "Invalid product or category"
+    );
+
+    error.status = 400;
+    throw error;
+  }
+
+  // Respect cooldown before contacting the provider.
+
+  if (Date.now() < blockedUntil) {
+    const seconds = Math.ceil(
+      (blockedUntil - Date.now()) / 1000
+    );
+
+    return savedSnapshot(
+      externalId,
+      `Live prices are temporarily rate limited. Retry in ${seconds} seconds.`
+    );
+  }
+
+  // Avoid duplicate requests for the same product.
+
+  if (pending.has(externalId)) {
+    return pending.get(externalId);
+  }
+
+  const task = performTracking(
+    product,
+    categorySlug,
+    externalId,
+    name
+  ).finally(() => {
+    pending.delete(externalId);
+  });
+
+  pending.set(externalId, task);
+
+  return task;
 }
 
 module.exports = {
