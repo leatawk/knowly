@@ -8,7 +8,7 @@ const overlay = {
   position: "fixed",
   inset: 0,
   zIndex: 10000,
-  background: "rgba(0,0,0,0.7)",
+  background: "rgba(0,0,0,.72)",
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
@@ -84,11 +84,20 @@ async function apiRequest(url, options = {}) {
     ...options
   });
 
-  const data = await response.json();
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(
+      `Server returned HTTP ${response.status}`
+    );
+  }
 
   if (!response.ok) {
     throw new Error(
-      data.error || "Request failed"
+      data.error ||
+      `Request failed (${response.status})`
     );
   }
 
@@ -104,17 +113,18 @@ function Modal({ title, onClose, children }) {
         aria-modal="true"
         aria-label={title}
       >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            gap: 12,
-            alignItems: "center"
-          }}
-        >
+        <div style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 12
+        }}>
           <h2>{title}</h2>
 
-          <button type="button" onClick={onClose}>
+          <button
+            type="button"
+            onClick={onClose}
+          >
             Close ✕
           </button>
         </div>
@@ -137,7 +147,9 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState("");
 
-  const [savedProducts, setSavedProducts] = useState({});
+  const [savedProducts, setSavedProducts] =
+    useState({});
+
   const [tracked, setTracked] = useState({});
 
   const [stores, setStores] = useState(null);
@@ -150,9 +162,10 @@ export default function App() {
   const searchVersion = useRef(0);
   const popupVersion = useRef(0);
 
-  const electronicsCategory =
-    category === "electronics" ||
-    category === "computers-accessories";
+  const electronicsCategory = [
+    "electronics",
+    "computers-accessories"
+  ].includes(category);
 
   // =====================================
   // LOAD CATEGORIES
@@ -209,7 +222,7 @@ export default function App() {
   }, [category, submitted]);
 
   // =====================================
-  // SEARCH PRODUCTS
+  // SEARCH ON SUBMIT
   // =====================================
 
   async function runSearch(event) {
@@ -225,8 +238,8 @@ export default function App() {
     setStores(null);
     setPart(null);
     setDetails(null);
-    setPicked([]);
     setComparison(null);
+    setPicked([]);
 
     if (!term) {
       setSubmitted("");
@@ -246,21 +259,26 @@ export default function App() {
       params.set("category", category);
     }
 
-    const localUrl = `${API}/products?${params}`;
+    const localUrl =
+      `${API}/products?${params}`;
+
     let liveUrl = localUrl;
 
     if (category === "groceries-food") {
       liveUrl =
         `${API}/external/food/search?q=` +
         encodeURIComponent(term);
+
     } else if (category === "beauty-personal-care") {
       liveUrl =
         `${API}/external/beauty/search?q=` +
         encodeURIComponent(term);
+
     } else if (electronicsCategory) {
       liveUrl =
         `${API}/external/lebtech/search?q=` +
         encodeURIComponent(term);
+
     } else if (category === "automotive") {
       liveUrl =
         `${API}/external/automotive/search?q=` +
@@ -268,32 +286,34 @@ export default function App() {
     }
 
     try {
-      let result;
+      let data;
 
       try {
-        result = await apiRequest(liveUrl);
+        data = await apiRequest(liveUrl);
       } catch (liveError) {
         if (liveUrl === localUrl) {
           throw liveError;
         }
 
-        result = await apiRequest(localUrl);
+        data = await apiRequest(localUrl);
 
         if (version === searchVersion.current) {
           setNotice(
-            "Live results are unavailable. " +
-            "Showing products already saved in Knowly."
+            "Live search is temporarily unavailable. " +
+            "Showing products saved in Knowly."
           );
         }
       }
 
       if (version === searchVersion.current) {
-        setProducts(result.products || []);
+        setProducts(data.products || []);
       }
+
     } catch (err) {
       if (version === searchVersion.current) {
         setError(err.message);
       }
+
     } finally {
       if (version === searchVersion.current) {
         setLoading(false);
@@ -312,22 +332,20 @@ export default function App() {
     setCategory(slug);
     setSearch("");
     setSubmitted("");
-
     setProducts([]);
     setLoading(false);
+
     setError("");
     setNotice("");
-
     setStores(null);
     setPart(null);
     setDetails(null);
-
     setPicked([]);
     setComparison(null);
   }
 
   // =====================================
-  // SAVE GROCERY OR BEAUTY
+  // SAVE GROCERY / BEAUTY PRODUCT
   // =====================================
 
   async function saveFactsProduct(product) {
@@ -336,7 +354,8 @@ export default function App() {
         ? "beauty"
         : "food";
 
-    const key = `${type}:${product.barcode}`;
+    const key =
+      `${type}:${product.barcode}`;
 
     setSaving(key);
     setError("");
@@ -353,17 +372,19 @@ export default function App() {
       }));
 
       setNotice(
-        `${product.name} saved to Knowly.`
+        `${product.name} saved successfully.`
       );
+
     } catch (err) {
       setError(err.message);
+
     } finally {
       setSaving("");
     }
   }
 
   // =====================================
-  // ELECTRONICS PRICE TRACKING
+  // STORE PRICES: ONE REQUEST ONLY
   // =====================================
 
   async function openStorePrices(product) {
@@ -382,14 +403,15 @@ export default function App() {
     setError("");
 
     try {
-      // Save offers and record price changes.
-      const result = await apiRequest(
+      const data = await apiRequest(
         `${API}/track/lebtech`,
         {
           method: "POST",
+
           headers: {
             "Content-Type": "application/json"
           },
+
           body: JSON.stringify({
             product: {
               externalId: product.externalId,
@@ -408,66 +430,40 @@ export default function App() {
         return;
       }
 
-      setTracked(previous => ({
-        ...previous,
-        [product.externalId]: result.productId
-      }));
+      if (data.productId) {
+        setTracked(previous => ({
+          ...previous,
+          [product.externalId]: data.productId
+        }));
+      }
 
       setStores({
         product,
         loading: false,
-        offers: result.offers || [],
-        history: result.history || [],
-        stats: result.stats || null,
-        warning: "",
+        offers: data.offers || [],
+        history: data.history || [],
+        stats: data.stats || null,
+        warning: data.warning || "",
         error: ""
       });
-    } catch (trackingError) {
-      // Display live prices even if saving fails.
-      try {
-        const reference =
-          product.externalId || product.productUrl;
 
-        if (!reference) {
-          throw trackingError;
-        }
-
-        const live = await apiRequest(
-          `${API}/external/lebtech/prices?product=` +
-          encodeURIComponent(reference)
-        );
-
-        if (version !== popupVersion.current) {
-          return;
-        }
-
-        setStores({
-          product,
-          loading: false,
-          offers: live.offers || [],
-          history: [],
-          stats: null,
-          error: "",
-          warning:
-            "Live prices loaded, but the database " +
-            "could not save the price history. " +
-            "Check your backend terminal."
-        });
-      } catch (err) {
-        if (version !== popupVersion.current) {
-          return;
-        }
-
-        setStores({
-          product,
-          loading: false,
-          offers: [],
-          history: [],
-          stats: null,
-          warning: "",
-          error: err.message
-        });
+    } catch (err) {
+      if (version !== popupVersion.current) {
+        return;
       }
+
+      // Do not immediately contact the provider again.
+
+      setStores({
+        product,
+        loading: false,
+        offers: [],
+        history: [],
+        stats: null,
+        warning: "",
+        error:
+          `Prices could not be loaded. ${err.message}`
+      });
     }
   }
 
@@ -502,13 +498,13 @@ export default function App() {
           error: ""
         });
       }
+
     } catch {
       if (version === popupVersion.current) {
         setPart({
           product,
           loading: false,
-          error:
-            "Additional details are not available."
+          error: "Additional details unavailable."
         });
       }
     }
@@ -529,6 +525,7 @@ export default function App() {
         ...product,
         offers: offers.offers || []
       });
+
     } catch (err) {
       setError(err.message);
     }
@@ -541,22 +538,25 @@ export default function App() {
   function togglePick(id) {
     const key = String(id);
 
-    if (picked.includes(key)) {
-      setPicked(
-        picked.filter(item => item !== key)
-      );
-    } else if (picked.length < 3) {
-      setPicked([
-        ...picked,
-        key
-      ]);
-    } else {
-      setError(
-        "Choose up to 3 products for comparison."
-      );
-    }
-
     setComparison(null);
+
+    setPicked(previous => {
+      if (previous.includes(key)) {
+        return previous.filter(
+          item => item !== key
+        );
+      }
+
+      if (previous.length >= 3) {
+        setError(
+          "Choose up to 3 products for comparison."
+        );
+
+        return previous;
+      }
+
+      return [...previous, key];
+    });
   }
 
   // =====================================
@@ -569,9 +569,11 @@ export default function App() {
         `${API}/compare`,
         {
           method: "POST",
+
           headers: {
             "Content-Type": "application/json"
           },
+
           body: JSON.stringify({
             ids: picked
           })
@@ -579,6 +581,7 @@ export default function App() {
       );
 
       setComparison(data.products || []);
+
     } catch (err) {
       setError(err.message);
     }
@@ -587,9 +590,9 @@ export default function App() {
   const specKeys = comparison
     ? [
         ...new Set(
-          comparison.flatMap(item =>
+          comparison.flatMap(product =>
             Object.keys(
-              getSpecs(item.specifications)
+              getSpecs(product.specifications)
             )
           )
         )
@@ -617,7 +620,6 @@ export default function App() {
 
       <form onSubmit={runSearch}>
         <input
-          type="text"
           value={search}
           onChange={event =>
             setSearch(event.target.value)
@@ -625,7 +627,10 @@ export default function App() {
           placeholder="Search products, brands, models or part numbers..."
         />
 
-        <button type="submit" disabled={loading}>
+        <button
+          type="submit"
+          disabled={loading}
+        >
           {loading ? "Searching..." : "Search"}
         </button>
       </form>
@@ -675,9 +680,9 @@ export default function App() {
 
       {category === "automotive" && (
         <p className="steps">
-          Automotive prices are in SAR for Saudi Arabia,
-          not Lebanon. Confirm part compatibility before
-          purchasing.
+          Automotive listings are for Saudi Arabia
+          in SAR, not verified Lebanese prices.
+          Confirm vehicle compatibility before purchasing.
         </p>
       )}
 
@@ -695,225 +700,243 @@ export default function App() {
           </p>
         )}
 
-        {!loading && products.map((product, index) => {
-          const electronics =
-            product.source === "LebTech";
+        {!loading && products.map(
+          (product, index) => {
+            const isElectronics =
+              product.source === "LebTech";
 
-          const automotive =
-            product.source === "Automotive";
+            const isAutomotive =
+              product.source === "Automotive";
 
-          const externalFacts = [
-            "Open Food Facts",
-            "Open Beauty Facts"
-          ].includes(product.source);
+            const isFacts = [
+              "Open Food Facts",
+              "Open Beauty Facts"
+            ].includes(product.source);
 
-          const type =
-            product.source === "Open Beauty Facts"
-              ? "beauty"
-              : "food";
+            const type =
+              product.source === "Open Beauty Facts"
+                ? "beauty"
+                : "food";
 
-          const factsKey =
-            `${type}:${product.barcode}`;
+            const factsKey =
+              `${type}:${product.barcode}`;
 
-          const saved =
-            savedProducts[factsKey];
+            const saved =
+              savedProducts[factsKey];
 
-          const id = electronics
-            ? tracked[product.externalId]
-            : (saved?.id || product.id);
+            const id = isElectronics
+              ? tracked[product.externalId]
+              : (saved?.id || product.id);
 
-          const key = electronics
-            ? product.externalId || index
-            : automotive
-              ? product.oem || index
-              : externalFacts
-                ? factsKey
-                : product.id;
+            const key = isElectronics
+              ? product.externalId || index
+              : isAutomotive
+                ? product.oem || index
+                : isFacts
+                  ? factsKey
+                  : product.id;
 
-          return (
-            <div className="card" key={key}>
+            return (
+              <div
+                className="card"
+                key={key}
+              >
 
-              {(product.image || product.image_url) && (
-                <img
-                  className="product-image"
-                  src={
-                    product.image ||
-                    product.image_url
-                  }
-                  alt={product.name}
-                />
-              )}
-
-              <div className="product-info">
-
-                <small>
-                  {product.brand ||
-                    product.brand_name ||
-                    "Brand not specified"}
-                </small>
-
-                <h3>{product.name}</h3>
-
-                {product.quantity && (
-                  <p>{product.quantity}</p>
-                )}
-
-                <p className="category-name">
-                  {product.category_name ||
-                    product.category ||
-                    ""}
-                </p>
-
-                {electronics && (
-                  <>
-                    <p className="price">
-                      {product.minPrice != null
-                        ? `From ${showPrice(product.minPrice)}`
-                        : "Price unavailable"}
-                    </p>
-
-                    <small>
-                      Compare prices from Lebanese stores
-                    </small>
-                  </>
-                )}
-
-                {automotive && (
-                  <>
-                    {product.oem && (
-                      <p>
-                        Part number: {product.oem}
-                      </p>
-                    )}
-
-                    {product.grade && (
-                      <p>
-                        Type: {product.grade}
-                      </p>
-                    )}
-
-                    <p className="price">
-                      {showPrice(product.price, "SAR")}
-                    </p>
-
-                    <small>
-                      Saudi Arabia listing
-                    </small>
-                  </>
-                )}
-
-              </div>
-
-              {/* ACTIONS */}
-
-              <div>
-
-                {electronics ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        openStorePrices(product)
-                      }
-                    >
-                      Compare Store Prices
-                    </button>
-
-                    {id && (
-                      <p>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={picked.includes(String(id))}
-                            onChange={() =>
-                              togglePick(id)
-                            }
-                          />
-                          {" "}Compare product
-                        </label>
-                      </p>
-                    )}
-
-                    {product.productUrl && (
-                      <p>
-                        <a
-                          href={product.productUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          View Product Listing
-                        </a>
-                      </p>
-                    )}
-                  </>
-
-                ) : automotive ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        openPartDetails(product)
-                      }
-                    >
-                      View Part Details
-                    </button>
-
-                    {product.productUrl && (
-                      <p>
-                        <a
-                          href={product.productUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          View Product Listing
-                        </a>
-                      </p>
-                    )}
-                  </>
-
-                ) : externalFacts && !saved ? (
-                  <button
-                    type="button"
-                    disabled={saving === factsKey}
-                    onClick={() =>
-                      saveFactsProduct(product)
+                {(product.image ||
+                  product.image_url) && (
+                  <img
+                    className="product-image"
+                    src={
+                      product.image ||
+                      product.image_url
                     }
-                  >
-                    {saving === factsKey
-                      ? "Saving..."
-                      : "Save to Knowly"}
-                  </button>
+                    alt={product.name}
+                  />
+                )}
 
-                ) : id ? (
-                  <>
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={picked.includes(String(id))}
-                        onChange={() =>
-                          togglePick(id)
+                <div className="product-info">
+
+                  <small>
+                    {product.brand ||
+                      product.brand_name ||
+                      "Brand not specified"}
+                  </small>
+
+                  <h3>{product.name}</h3>
+
+                  {product.quantity && (
+                    <p>{product.quantity}</p>
+                  )}
+
+                  <p className="category-name">
+                    {product.category_name ||
+                      product.category ||
+                      ""}
+                  </p>
+
+                  {isElectronics && (
+                    <>
+                      <p className="price">
+                        {product.minPrice != null
+                          ? `From ${showPrice(
+                              product.minPrice
+                            )}`
+                          : "Price unavailable"}
+                      </p>
+
+                      <small>
+                        Compare prices from Lebanese stores
+                      </small>
+                    </>
+                  )}
+
+                  {isAutomotive && (
+                    <>
+                      {product.oem && (
+                        <p>
+                          Part number: {product.oem}
+                        </p>
+                      )}
+
+                      {product.grade && (
+                        <p>
+                          Type: {product.grade}
+                        </p>
+                      )}
+
+                      <p className="price">
+                        {showPrice(
+                          product.price,
+                          "SAR"
+                        )}
+                      </p>
+
+                      <small>
+                        Saudi Arabia listing
+                      </small>
+                    </>
+                  )}
+
+                </div>
+
+                {/* ACTIONS */}
+
+                <div>
+
+                  {isElectronics ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openStorePrices(product)
                         }
-                      />
-                      {" "}Compare
-                    </label>
+                      >
+                        Compare Store Prices
+                      </button>
 
+                      {id && (
+                        <p>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={
+                                picked.includes(
+                                  String(id)
+                                )
+                              }
+                              onChange={() =>
+                                togglePick(id)
+                              }
+                            />
+                            {" "}Compare product
+                          </label>
+                        </p>
+                      )}
+
+                      {product.productUrl && (
+                        <p>
+                          <a
+                            href={product.productUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            View Product Listing
+                          </a>
+                        </p>
+                      )}
+                    </>
+
+                  ) : isAutomotive ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openPartDetails(product)
+                        }
+                      >
+                        View Part Details
+                      </button>
+
+                      {product.productUrl && (
+                        <p>
+                          <a
+                            href={product.productUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            View Product Listing
+                          </a>
+                        </p>
+                      )}
+                    </>
+
+                  ) : isFacts && !saved ? (
                     <button
                       type="button"
+                      disabled={saving === factsKey}
                       onClick={() =>
-                        openDetails(id)
+                        saveFactsProduct(product)
                       }
                     >
-                      Details
+                      {saving === factsKey
+                        ? "Saving..."
+                        : "Save to Knowly"}
                     </button>
-                  </>
 
-                ) : null}
+                  ) : id ? (
+                    <>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={
+                            picked.includes(
+                              String(id)
+                            )
+                          }
+                          onChange={() =>
+                            togglePick(id)
+                          }
+                        />
+                        {" "}Compare
+                      </label>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openDetails(id)
+                        }
+                      >
+                        Details
+                      </button>
+                    </>
+                  ) : null}
+
+                </div>
 
               </div>
-
-            </div>
-          );
-        })}
+            );
+          }
+        )}
 
       </div>
 
@@ -928,9 +951,7 @@ export default function App() {
         </button>
       )}
 
-      {/* =====================================
-          STORE PRICE COMPARISON + HISTORY
-          ===================================== */}
+      {/* STORE PRICE COMPARISON */}
 
       {stores && (
         <Modal
@@ -940,12 +961,19 @@ export default function App() {
             setStores(null);
           }}
         >
+
           <h3>{stores.product.name}</h3>
 
           {stores.loading && (
-            <p>
-              Checking retailer offers
-              and recording prices...
+            <p>Checking store prices...</p>
+          )}
+
+          {stores.warning && (
+            <p
+              className="steps"
+              role="status"
+            >
+              {stores.warning}
             </p>
           )}
 
@@ -955,19 +983,18 @@ export default function App() {
             </p>
           )}
 
-          {stores.warning && (
-            <p className="steps">
-              {stores.warning}
-            </p>
-          )}
-
-          {!stores.loading && !stores.error && (
+          {!stores.loading &&
+            !stores.error && (
             <>
 
               {stores.offers.length ? (
-                <div style={{ overflowX: "auto" }}>
+                <div style={{
+                  overflowX: "auto"
+                }}>
+                  <table style={{
+                    width: "100%"
+                  }}>
 
-                  <table style={{ width: "100%" }}>
                     <thead>
                       <tr>
                         <th>Store</th>
@@ -978,126 +1005,127 @@ export default function App() {
                     </thead>
 
                     <tbody>
-                      {stores.offers.map((offer, i) => (
-                        <tr key={i}>
-                          <td>
-                            {offer.storeName || "Store"}
-                          </td>
+                      {stores.offers.map(
+                        (offer, index) => (
+                          <tr key={index}>
 
-                          <td>
-                            {showPrice(
-                              offer.price,
-                              offer.currency || "USD"
-                            )}
-                          </td>
+                            <td>
+                              {offer.storeName ||
+                                "Store"}
+                            </td>
 
-                          <td>
-                            {offer.condition ||
-                              "Not specified"}
-                          </td>
+                            <td>
+                              {showPrice(
+                                offer.price,
+                                offer.currency || "USD"
+                              )}
+                            </td>
 
-                          <td>
-                            {offer.url ? (
-                              <a
-                                href={offer.url}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                Visit Store
-                              </a>
-                            ) : (
-                              "-"
-                            )}
-                          </td>
-                        </tr>
-                      ))}
+                            <td>
+                              {offer.condition ||
+                                "Not specified"}
+                            </td>
+
+                            <td>
+                              {offer.url ? (
+                                <a
+                                  href={offer.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  Visit Store
+                                </a>
+                              ) : "-"}
+                            </td>
+
+                          </tr>
+                        )
+                      )}
                     </tbody>
-                  </table>
 
+                  </table>
                 </div>
               ) : (
                 <p>
-                  No store offers were returned
-                  for this configuration.
+                  No saved or live store offers
+                  are available for this product.
                 </p>
               )}
-
-              {/* TRACKING STATISTICS */}
 
               {stores.stats && (
                 <p className="steps">
-                  {stores.stats.offersTracked} offers recorded
+                  {stores.stats.offersTracked} offers checked
                   {" · "}
                   {stores.stats.newOffers} new
                   {" · "}
-                  {stores.stats.priceChanges} changed prices
+                  {stores.stats.priceChanges} changed
                 </p>
               )}
 
-              {/* PRICE HISTORY */}
-
-              {stores.stats && (
+              {stores.history.length > 0 && (
                 <>
                   <h3>Recorded Price History</h3>
 
-                  {stores.history.length ? (
-                    <div style={{ overflowX: "auto" }}>
+                  <div style={{
+                    overflowX: "auto"
+                  }}>
+                    <table style={{
+                      width: "100%"
+                    }}>
 
-                      <table style={{ width: "100%" }}>
-                        <thead>
-                          <tr>
-                            <th>Recorded</th>
-                            <th>Store</th>
-                            <th>Price</th>
-                            <th>Condition</th>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Store</th>
+                          <th>Price</th>
+                          <th>Condition</th>
+                        </tr>
+                      </thead>
+
+                      <tbody>
+                        {stores.history
+                          .slice(0, 30)
+                          .map(row => (
+                          <tr key={row.id}>
+
+                            <td>
+                              {new Date(
+                                row.recorded_at
+                              ).toLocaleString()}
+                            </td>
+
+                            <td>
+                              {row.store_name ||
+                                "Store"}
+                            </td>
+
+                            <td>
+                              {showPrice(
+                                row.price,
+                                row.currency
+                              )}
+                            </td>
+
+                            <td>
+                              {row.condition || "-"}
+                            </td>
+
                           </tr>
-                        </thead>
+                        ))}
+                      </tbody>
 
-                        <tbody>
-                          {stores.history.slice(0, 30).map(row => (
-                            <tr key={row.id}>
-                              <td>
-                                {new Date(
-                                  row.recorded_at
-                                ).toLocaleString()}
-                              </td>
-
-                              <td>
-                                {row.store_name || "Store"}
-                              </td>
-
-                              <td>
-                                {showPrice(
-                                  row.price,
-                                  row.currency
-                                )}
-                              </td>
-
-                              <td>
-                                {row.condition || "-"}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-
-                    </div>
-                  ) : (
-                    <p>
-                      No price observations
-                      have been recorded yet.
-                    </p>
-                  )}
+                    </table>
+                  </div>
                 </>
               )}
 
             </>
           )}
 
-          <small>
-            Prices and stock can change.
-            Check details directly with the store.
-          </small>
+          <p className="steps">
+            Prices and availability may change.
+            Confirm directly with the retailer.
+          </p>
 
         </Modal>
       )}
@@ -1112,10 +1140,11 @@ export default function App() {
             setPart(null);
           }}
         >
+
           <h3>{part.product.name}</h3>
 
           {part.loading && (
-            <p>Loading additional information...</p>
+            <p>Loading additional details...</p>
           )}
 
           {part.error && (
@@ -1123,24 +1152,33 @@ export default function App() {
           )}
 
           <p>
-            Part number:
-            {" "}
-            {part.product.oem || "Unavailable"}
+            Part number: {
+              part.product.oem ||
+              "Unavailable"
+            }
           </p>
 
           <p>
-            Type:
-            {" "}
-            {part.product.grade || "Not specified"}
+            Type: {
+              part.product.grade ||
+              "Not specified"
+            }
           </p>
 
-          <p>
-            {showPrice(part.product.price, "SAR")}
-          </p>
+          <h3>
+            {showPrice(
+              part.product.price,
+              "SAR"
+            )}
+          </h3>
 
-          <pre style={{ whiteSpace: "pre-wrap" }}>
+          <pre style={{
+            whiteSpace: "pre-wrap"
+          }}>
             {JSON.stringify(
-              getSpecs(part.product.specifications),
+              getSpecs(
+                part.product.specifications
+              ),
               null,
               2
             )}
@@ -1150,6 +1188,7 @@ export default function App() {
             Saudi Arabian listing.
             Verify vehicle compatibility.
           </p>
+
         </Modal>
       )}
 
@@ -1162,10 +1201,14 @@ export default function App() {
             setDetails(null)
           }
         >
+
           <h3>{details.name}</h3>
 
           <p>
-            Brand: {details.brand_name || "Unknown"}
+            Brand: {
+              details.brand_name ||
+              "Unknown"
+            }
           </p>
 
           <p>
@@ -1175,9 +1218,13 @@ export default function App() {
 
           <h3>Specifications</h3>
 
-          <pre style={{ whiteSpace: "pre-wrap" }}>
+          <pre style={{
+            whiteSpace: "pre-wrap"
+          }}>
             {JSON.stringify(
-              getSpecs(details.specifications),
+              getSpecs(
+                details.specifications
+              ),
               null,
               2
             )}
@@ -1199,10 +1246,11 @@ export default function App() {
           ) : (
             <p>No saved store offers.</p>
           )}
+
         </Modal>
       )}
 
-      {/* SAVED PRODUCT COMPARISON */}
+      {/* PRODUCT COMPARISON */}
 
       {comparison && (
         <Modal
@@ -1211,16 +1259,19 @@ export default function App() {
             setComparison(null)
           }
         >
-          <div style={{ overflowX: "auto" }}>
 
+          <div style={{
+            overflowX: "auto"
+          }}>
             <table>
+
               <thead>
                 <tr>
                   <th>Feature</th>
 
-                  {comparison.map(p => (
-                    <th key={p.id}>
-                      {p.name}
+                  {comparison.map(product => (
+                    <th key={product.id}>
+                      {product.name}
                     </th>
                   ))}
                 </tr>
@@ -1231,9 +1282,9 @@ export default function App() {
                 <tr>
                   <td>Brand</td>
 
-                  {comparison.map(p => (
-                    <td key={p.id}>
-                      {p.brand_name || "-"}
+                  {comparison.map(product => (
+                    <td key={product.id}>
+                      {product.brand_name || "-"}
                     </td>
                   ))}
                 </tr>
@@ -1241,31 +1292,31 @@ export default function App() {
                 <tr>
                   <td>Category</td>
 
-                  {comparison.map(p => (
-                    <td key={p.id}>
-                      {p.category_name || "-"}
+                  {comparison.map(product => (
+                    <td key={product.id}>
+                      {product.category_name || "-"}
                     </td>
                   ))}
                 </tr>
 
                 <tr>
-                  <td>Best saved store price</td>
+                  <td>Lowest saved store price</td>
 
-                  {comparison.map(p => (
-                    <td key={p.id}>
-                      {p.best_price != null
+                  {comparison.map(product => (
+                    <td key={product.id}>
+                      {product.best_price != null
                         ? (
                             showPrice(
-                              p.best_price,
-                              p.best_currency
+                              product.best_price,
+                              product.best_currency
                             ) +
                             (
-                              p.best_store
-                                ? ` · ${p.best_store}`
+                              product.best_store
+                                ? ` · ${product.best_store}`
                                 : ""
                             )
                           )
-                        : "No verified offer"}
+                        : "No saved offer"}
                     </td>
                   ))}
                 </tr>
@@ -1274,10 +1325,12 @@ export default function App() {
                   <tr key={key}>
                     <td>{key}</td>
 
-                    {comparison.map(p => (
-                      <td key={p.id}>
+                    {comparison.map(product => (
+                      <td key={product.id}>
                         {display(
-                          getSpecs(p.specifications)[key]
+                          getSpecs(
+                            product.specifications
+                          )[key]
                         )}
                       </td>
                     ))}
@@ -1285,14 +1338,15 @@ export default function App() {
                 ))}
 
               </tbody>
-            </table>
 
+            </table>
           </div>
 
           <small>
-            Prices from different markets or currencies
-            should not be compared directly.
+            Prices from different currencies
+            or markets should not be compared directly.
           </small>
+
         </Modal>
       )}
 
