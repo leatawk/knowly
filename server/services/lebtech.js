@@ -1,10 +1,100 @@
 
-const ENDPOINT = "https://lebtechlb.com/api/mcp";
+// =====================================================
+// LEBANESE ELECTRONICS PRICES (LebTech MCP)
+//
+// The provider allows roughly 5 requests per 10 seconds
+// per IP address and re-checks shop prices nightly.
+// To stay inside that limit this file:
+//   - keeps ONE connection open instead of reconnecting
+//     for every search (a new connection costs 3-4 requests)
+//   - spaces calls a little apart
+//   - caches answers for 30 minutes
+//   - shares identical requests that are already running
+//   - stops calling the provider during a rate-limit pause
+// =====================================================
+
+const ENDPOINT =
+  process.env.LEBTECH_MCP_URL || "https://lebtechlb.com/api/mcp";
+
+const CACHE_MS = 30 * 60 * 1000;
+const MIN_GAP_MS = 1500;
+const MAX_CACHE_ENTRIES = 300;
 
 const cache = new Map();
-const CACHE_MS = 10 * 60 * 1000;
+const pending = new Map();
 
-async function callTool(name, args) {
+let session = null;
+let queue = Promise.resolve();
+let lastCallAt = 0;
+
+let blockedUntil = 0;
+let consecutiveLimits = 0;
+
+// =====================================
+// RATE LIMITING
+// =====================================
+
+function isRateLimited(error) {
+  return (
+    error?.code === "RATE_LIMITED" ||
+    Number(error?.code || error?.status) === 429 ||
+    /(?:\b429\b|error.?1015|rate.?limit|too many requests)/i.test(
+      String(error?.message || "")
+    )
+  );
+}
+
+function rateLimitRemaining() {
+  return Math.max(
+    0,
+    Math.ceil((blockedUntil - Date.now()) / 1000)
+  );
+}
+
+function rateLimitError(seconds) {
+  const error = new Error(
+    `Live prices are temporarily rate limited. Retry in ${seconds} seconds.`
+  );
+
+  error.code = "RATE_LIMITED";
+  error.status = 429;
+  error.retryAfter = seconds;
+
+  return error;
+}
+
+function startCooldown(error) {
+  consecutiveLimits++;
+
+  const reported = Number(
+    String(error?.message || "").match(
+      /"?retry[_-]after"?\s*[:=]\s*(\d+)/i
+    )?.[1] || 0
+  );
+
+  const seconds = Math.min(
+    600,
+    Math.max(
+      30,
+      reported,
+      30 * 2 ** Math.min(consecutiveLimits - 1, 5)
+    )
+  );
+
+  blockedUntil = Date.now() + seconds * 1000;
+
+  console.warn(
+    `Electronics price requests paused for ${seconds} seconds (rate limit).`
+  );
+
+  return seconds;
+}
+
+// =====================================
+// ONE SHARED CONNECTION
+// =====================================
+
+async function openSession() {
   const { Client } = await import(
     "@modelcontextprotocol/sdk/client/index.js"
   );
@@ -17,56 +107,166 @@ async function callTool(name, args) {
     version: "1.0.0"
   });
 
-  try {
-    const transport = new StreamableHTTPClientTransport(
-      new URL(ENDPOINT)
-    );
+  const transport = new StreamableHTTPClientTransport(
+    new URL(ENDPOINT)
+  );
 
-    await client.connect(transport);
+  await client.connect(transport);
 
-    const response = await client.callTool(
-      { name, arguments: args },
-      undefined,
-      { timeout: 20000 }
-    );
+  return client;
+}
 
-    if (response.isError) {
-      throw new Error("LebTech returned a tool error");
-    }
+function getSession() {
+  if (!session) {
+    const opening = openSession();
 
-    if (response.structuredContent) {
-      return response.structuredContent;
-    }
+    session = opening;
 
-    const text = (response.content || [])
-      .filter(item => item.type === "text")
-      .map(item => item.text)
-      .join("\n");
+    opening.catch(() => {
+      if (session === opening) session = null;
+    });
+  }
 
+  return session;
+}
+
+async function dropSession() {
+  const current = session;
+  session = null;
+
+  if (current) {
     try {
-      return JSON.parse(text);
+      const client = await current;
+      await client.close();
     } catch {
-      const block = text.match(
-        /```(?:json)?\s*([\s\S]*?)```/
-      );
-
-      if (block) {
-        return JSON.parse(block[1]);
-      }
-
-      console.error(
-        "Unexpected LebTech response:",
-        text.slice(0, 500)
-      );
-
-      throw new Error(
-        "LebTech returned an unexpected response format"
-      );
+      // The connection was already unusable.
     }
-  } finally {
-    await client.close().catch(() => {});
   }
 }
+
+function readResponse(response) {
+  if (response.isError) {
+    const error = new Error("LebTech returned a tool error");
+    error.final = true;
+    throw error;
+  }
+
+  if (response.structuredContent) {
+    return response.structuredContent;
+  }
+
+  const text = (response.content || [])
+    .filter(item => item.type === "text")
+    .map(item => item.text)
+    .join("\n");
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    const block = text.match(
+      /```(?:json)?\s*([\s\S]*?)```/
+    );
+
+    if (block) {
+      try {
+        return JSON.parse(block[1]);
+      } catch {
+        // Falls through to the error below.
+      }
+    }
+
+    console.error(
+      "Unexpected LebTech response:",
+      text.slice(0, 500)
+    );
+
+    const error = new Error(
+      "LebTech returned an unexpected response format"
+    );
+
+    error.final = true;
+    throw error;
+  }
+}
+
+async function request(name, args) {
+  const client = await getSession();
+
+  const response = await client.callTool(
+    { name, arguments: args },
+    undefined,
+    { timeout: 20000 }
+  );
+
+  return readResponse(response);
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function callTool(name, args) {
+  if (rateLimitRemaining() > 0) {
+    throw rateLimitError(rateLimitRemaining());
+  }
+
+  // Calls run one after another, slightly spaced.
+  const task = queue.then(async () => {
+    if (rateLimitRemaining() > 0) {
+      throw rateLimitError(rateLimitRemaining());
+    }
+
+    const gap = lastCallAt + MIN_GAP_MS - Date.now();
+    if (gap > 0) await wait(gap);
+
+    try {
+      const data = await request(name, args);
+      consecutiveLimits = 0;
+      return data;
+
+    } catch (error) {
+      if (isRateLimited(error)) {
+        await dropSession();
+        throw rateLimitError(startCooldown(error));
+      }
+
+      const timedOut = /timed? ?out/i.test(
+        String(error?.message || "")
+      );
+
+      if (error.final || timedOut) throw error;
+
+      // The saved connection may have expired:
+      // reconnect once and try again.
+      await dropSession();
+
+      try {
+        const data = await request(name, args);
+        consecutiveLimits = 0;
+        return data;
+
+      } catch (retryError) {
+        if (!retryError.final) await dropSession();
+
+        if (isRateLimited(retryError)) {
+          throw rateLimitError(startCooldown(retryError));
+        }
+
+        throw retryError;
+      }
+    } finally {
+      lastCallAt = Date.now();
+    }
+  });
+
+  queue = task.catch(() => {});
+
+  return task;
+}
+
+// =====================================
+// RESPONSE HELPERS
+// =====================================
 
 function findArray(data, keys) {
   const queue = [data];
@@ -130,6 +330,12 @@ function money(value) {
   return Number.isFinite(result) ? result : null;
 }
 
+function plainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+}
+
 function normalizeProduct(item) {
   const p = item.product || item;
 
@@ -178,12 +384,22 @@ function normalizeProduct(item) {
       p.page ||
       p.lebtech_url ||
       null,
+    specifications:
+      plainObject(p.specs) ||
+      plainObject(p.specifications) ||
+      plainObject(p.attributes) ||
+      {},
     source: "LebTech"
   };
 }
 
 function normalizeOffer(item) {
   const store = item.shop || item.store || {};
+  const details =
+    plainObject(item.attributes) ||
+    plainObject(item.specs) ||
+    plainObject(item.variant) ||
+    {};
 
   return {
     storeName:
@@ -214,9 +430,33 @@ function normalizeOffer(item) {
     checkedAt:
       item.checked_at ||
       item.updated_at ||
-      null
+      null,
+
+    // Details that tell one listing of a store from
+    // another (colour, storage, SIM ...).
+    title:
+      item.title ||
+      item.listing_title ||
+      item.product_title ||
+      item.product_name ||
+      item.name ||
+      null,
+    variant:
+      typeof item.variant === "string"
+        ? item.variant
+        : item.variant_name || null,
+    attributes: {
+      color: item.color ?? item.colour ?? details.color ?? details.colour ?? null,
+      storage: item.storage ?? item.capacity ?? details.storage ?? null,
+      ram: item.ram ?? details.ram ?? null,
+      sim: item.sim ?? details.sim ?? null
+    }
   };
 }
+
+// =====================================
+// CACHE
+// =====================================
 
 async function cachedCall(key, action) {
   const saved = cache.get(key);
@@ -225,15 +465,35 @@ async function cachedCall(key, action) {
     return saved.data;
   }
 
-  const data = await action();
+  if (pending.has(key)) {
+    return pending.get(key);
+  }
 
-  cache.set(key, {
-    data,
-    expiresAt: Date.now() + CACHE_MS
-  });
+  const task = action()
+    .then(data => {
+      if (cache.size >= MAX_CACHE_ENTRIES) {
+        cache.delete(cache.keys().next().value);
+      }
 
-  return data;
+      cache.set(key, {
+        data,
+        expiresAt: Date.now() + CACHE_MS
+      });
+
+      return data;
+    })
+    .finally(() => {
+      pending.delete(key);
+    });
+
+  pending.set(key, task);
+
+  return task;
 }
+
+// =====================================
+// SEARCH PRODUCTS
+// =====================================
 
 async function searchProducts(query) {
   const term = String(query || "").trim();
@@ -260,6 +520,10 @@ async function searchProducts(query) {
   });
 }
 
+// =====================================
+// STORE PRICES FOR ONE PRODUCT
+// =====================================
+
 async function getProductPrices(product) {
   const reference = String(product || "").trim();
 
@@ -281,14 +545,21 @@ async function getProductPrices(product) {
       "listings"
     ]);
 
+    // When the answer comes from the cache, this is the
+    // moment the prices were really fetched.
+    const fetchedAt = new Date().toISOString();
+
     return raw
       .map(normalizeOffer)
       .filter(item => item.price !== null)
+      .map(item => ({ ...item, fetchedAt }))
       .sort((a, b) => a.price - b.price);
   });
 }
 
 module.exports = {
   searchProducts,
-  getProductPrices
+  getProductPrices,
+  isRateLimited,
+  rateLimitRemaining
 };
