@@ -1,6 +1,21 @@
 
+// =====================================================
+// ELECTRONICS PRICE TRACKING
+//
+// Fetches the live Lebanese store listings of a product,
+// saves every genuinely different listing as its own
+// offer (colour, storage, SIM, condition, product page)
+// and records price changes in price_history.
+// =====================================================
+
 const db = require("../db");
 const electronics = require("./lebtech");
+const store = require("./offerStore");
+const {
+  canonicalURL,
+  safeURL,
+  describeVariant
+} = require("./normalize");
 
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -19,18 +34,6 @@ function clean(value, max = 255) {
   return typeof value === "string"
     ? value.trim().slice(0, max)
     : "";
-}
-
-function safeURL(value) {
-  try {
-    const url = new URL(value);
-
-    return ["https:", "http:"].includes(url.protocol)
-      ? url.href
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function toPrice(value) {
@@ -68,6 +71,7 @@ function startCooldown(error) {
   consecutiveLimits++;
 
   const reported = Number(
+    error?.retryAfter ||
     String(error?.message || "").match(
       /"retry_after"\s*:\s*(\d+)/
     )?.[1] || 30
@@ -94,10 +98,15 @@ function startCooldown(error) {
 }
 
 // =====================================
-// NORMALIZE STORE OFFERS
+// NORMALIZE STORE LISTINGS
+//
+// A listing is identified by store + condition +
+// variant + product page. Two listings are merged only
+// when all four are identical (a true duplicate) or when
+// the store gives nothing to tell them apart.
 // =====================================
 
-function normalizeOffers(rawOffers) {
+function normalizeOffers(rawOffers, productName) {
   const unique = new Map();
 
   for (const item of rawOffers) {
@@ -128,12 +137,15 @@ function normalizeOffers(rawOffers) {
         : clean(item.availability, 50) || "Unknown";
 
     const parsedTime = Date.parse(
-      item.checkedAt || ""
+      item.checkedAt || item.fetchedAt || ""
     );
 
     const checkedAt = Number.isFinite(parsedTime)
       ? new Date(parsedTime).toISOString()
       : new Date().toISOString();
+
+    const url = canonicalURL(item.url);
+    const variant = describeVariant(item, productName);
 
     const offer = {
       storeName,
@@ -141,12 +153,17 @@ function normalizeOffers(rawOffers) {
       condition,
       currency,
       availability,
-      url: safeURL(item.url),
+      url,
+      variant,
       checkedAt
     };
 
-    const key =
-      `${storeName.toLowerCase()}|${condition.toLowerCase()}`;
+    const key = [
+      storeName.toLowerCase(),
+      condition.toLowerCase(),
+      variant ? variant.key : "",
+      url || ""
+    ].join("|");
 
     const previous = unique.get(key);
 
@@ -158,7 +175,9 @@ function normalizeOffers(rawOffers) {
     }
   }
 
-  return [...unique.values()];
+  return [...unique.values()].sort(
+    (a, b) => Number(a.amount) - Number(b.amount)
+  );
 }
 
 // =====================================
@@ -181,12 +200,15 @@ async function getProductHistory(productId) {
       h.currency,
       h.recorded_at,
       s.name AS store_name,
-      o."condition" AS condition
+      o."condition" AS condition,
+      v.variant_name AS variant
     FROM public.price_history h
     JOIN public.offers o
       ON o.id = h.offer_id
     LEFT JOIN public.stores s
       ON s.id = o.store_id
+    LEFT JOIN public.product_variants v
+      ON v.id = o.variant_id
     WHERE o.product_id = $1
     ORDER BY h.recorded_at DESC, h.id DESC
     LIMIT 100
@@ -228,32 +250,14 @@ async function savedSnapshot(externalId, reason) {
     };
   }
 
-  const saved = await db.pool.query(
-    `
-    SELECT
-      s.name AS "storeName",
-      o.price,
-      o.currency,
-      o."condition" AS condition,
-      o.availability,
-      o.product_url AS url,
-      o.last_checked_at AS "checkedAt"
-    FROM public.offers o
-    LEFT JOIN public.stores s
-      ON s.id = o.store_id
-    WHERE o.product_id = $1
-      AND o.price IS NOT NULL
-    ORDER BY o.price ASC
-    `,
-    [productId]
-  );
+  const offers = await store.readOffers(productId);
 
   return {
     productId,
-    offers: saved.rows,
+    offers,
     history: await getProductHistory(productId),
     stats: null,
-    warning: saved.rows.length
+    warning: offers.length
       ? `${reason} Showing previously saved prices, which may be outdated.`
       : `${reason} No previously saved offers exist for this product yet.`,
     fromSavedData: true
@@ -298,7 +302,7 @@ async function performTracking(
     );
   }
 
-  const validOffers = normalizeOffers(liveOffers);
+  const validOffers = normalizeOffers(liveOffers, name);
 
   if (validOffers.length === 0) {
     return savedSnapshot(
@@ -310,14 +314,17 @@ async function performTracking(
   const client = await db.pool.connect();
 
   let productId;
+  const liveIds = new Set();
 
   const stats = {
+    listingsReceived: liveOffers.length,
+    offersTracked: validOffers.length,
     newOffers: 0,
     priceChanges: 0,
     unchangedOffers: 0,
     skippedOffers:
       liveOffers.length - validOffers.length,
-    offersTracked: validOffers.length
+    noLongerListed: 0
   };
 
   try {
@@ -349,51 +356,18 @@ async function performTracking(
       );
     }
 
-    // DATA SOURCE
-
-    const source = await client.query(
-      `
-      INSERT INTO public.data_sources
-        (
-          name,
-          source_type,
-          description,
-          base_url
-        )
-      VALUES (
-        'LebTech',
-        'MCP',
-        'Lebanese retailer prices',
-        'https://lebtechlb.com/api/mcp'
-      )
-      ON CONFLICT (name)
-      DO UPDATE SET is_active = TRUE
-      RETURNING id
-      `
+    const sourceId = await store.ensureSource(
+      client,
+      "LebTech",
+      "MCP",
+      "Lebanese retailer prices",
+      "https://lebtechlb.com/api/mcp"
     );
 
-    const sourceId = source.rows[0].id;
-
-    // BRAND
-
-    let brandId = null;
-
-    const brandName = clean(product.brand);
-
-    if (brandName) {
-      const brand = await client.query(
-        `
-        INSERT INTO public.brands (name)
-        VALUES ($1)
-        ON CONFLICT (name)
-        DO UPDATE SET name = EXCLUDED.name
-        RETURNING id
-        `,
-        [brandName]
-      );
-
-      brandId = brand.rows[0].id;
-    }
+    const brandId = await store.ensureBrand(
+      client,
+      clean(product.brand)
+    );
 
     // PRODUCT
 
@@ -473,152 +447,135 @@ async function performTracking(
       productId = inserted.rows[0].id;
     }
 
-    // STORE OFFERS
+    // OFFERS ALREADY SAVED FOR THIS PRODUCT
+
+    const saved = await client.query(
+      `
+      SELECT
+        id,
+        store_id,
+        variant_id,
+        COALESCE("condition", 'New') AS condition,
+        product_url,
+        price,
+        currency,
+        availability
+      FROM public.offers
+      WHERE product_id = $1
+        AND (data_source_id = $2 OR data_source_id IS NULL)
+      ORDER BY id
+      FOR UPDATE
+      `,
+      [productId, sourceId]
+    );
+
+    const free = saved.rows.map(row => ({
+      ...row,
+      url: canonicalURL(row.product_url)
+    }));
+
+    const take = test => {
+      const index = free.findIndex(test);
+      return index === -1 ? null : free.splice(index, 1)[0];
+    };
+
+    const same = (a, b) => String(a ?? "") === String(b ?? "");
+
+    // The lowest listing of each store + condition may
+    // take over an offer saved before variants existed.
+    const firstOfGroup = new Set();
+    const liveUrls = new Set(
+      validOffers.map(offer => offer.url).filter(Boolean)
+    );
+
+    // STORE LISTINGS
 
     for (const offer of validOffers) {
       const website = offer.url
         ? new URL(offer.url).origin
         : null;
 
-      const store = await client.query(
-        `
-        INSERT INTO public.stores
-          (name, website_url, country)
-        VALUES ($1, $2, 'Lebanon')
-        ON CONFLICT (name, country)
-        DO UPDATE SET
-          website_url = COALESCE(
-            EXCLUDED.website_url,
-            stores.website_url
-          )
-        RETURNING id
-        `,
-        [offer.storeName, website]
+      const storeId = await store.ensureStore(
+        client,
+        offer.storeName,
+        website,
+        "Lebanon"
       );
 
-      const previous = await client.query(
-        `
-        SELECT
-          id,
-          price,
-          currency
-        FROM public.offers
-        WHERE product_id = $1
-          AND store_id = $2
-          AND variant_id IS NULL
-          AND COALESCE("condition", 'New') = $3
-        ORDER BY id
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [
-          productId,
-          store.rows[0].id,
-          offer.condition
-        ]
+      const variantId = await store.ensureVariant(
+        client,
+        productId,
+        offer.variant
       );
 
-      let offerId;
-      let changed;
+      const inGroup = row =>
+        same(row.store_id, storeId) &&
+        row.condition === offer.condition;
 
-      if (previous.rows.length) {
-        const prior = previous.rows[0];
-        offerId = prior.id;
+      const group = `${storeId}|${offer.condition}`;
+      const isFirst = !firstOfGroup.has(group);
+      firstOfGroup.add(group);
 
-        changed =
-          prior.price === null ||
-          Number(prior.price).toFixed(2) !== offer.amount ||
-          prior.currency !== offer.currency;
+      const previous =
+        // 1. the same listing
+        take(row =>
+          inGroup(row) &&
+          same(row.variant_id, variantId) &&
+          same(row.url, offer.url)
+        ) ||
+        // 2. the same product page, saved before its
+        //    variant was known
+        (offer.url && take(row =>
+          inGroup(row) && row.url === offer.url
+        )) ||
+        // 3. an older offer of this store that no
+        //    current listing matches
+        (isFirst && take(row =>
+          inGroup(row) &&
+          row.variant_id === null &&
+          (!row.url || !liveUrls.has(row.url))
+        )) ||
+        null;
 
-        await client.query(
-          `
-          UPDATE public.offers
-          SET
-            price = $2,
-            currency = $3,
-            "condition" = $4,
-            availability = $5,
-            product_url = COALESCE(
-              $6,
-              product_url
-            ),
-            last_checked_at = $7,
-            data_source_id = $8
-          WHERE id = $1
-          `,
-          [
-            offerId,
-            offer.amount,
-            offer.currency,
-            offer.condition,
-            offer.availability,
-            offer.url,
-            offer.checkedAt,
-            sourceId
-          ]
-        );
+      const result = await store.saveOffer(client, previous, {
+        productId,
+        storeId,
+        variantId,
+        sourceId,
+        price: offer.amount,
+        currency: offer.currency,
+        condition: offer.condition,
+        availability: offer.availability,
+        url: offer.url,
+        checkedAt: offer.checkedAt
+      });
 
-        if (changed) {
-          stats.priceChanges++;
-        } else {
-          stats.unchangedOffers++;
-        }
-      } else {
-        const inserted = await client.query(
-          `
-          INSERT INTO public.offers
-            (
-              product_id,
-              store_id,
-              data_source_id,
-              price,
-              currency,
-              "condition",
-              availability,
-              product_url,
-              last_checked_at
-            )
-          VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9
-          )
-          RETURNING id
-          `,
-          [
-            productId,
-            store.rows[0].id,
-            sourceId,
-            offer.amount,
-            offer.currency,
-            offer.condition,
-            offer.availability,
-            offer.url,
-            offer.checkedAt
-          ]
-        );
+      liveIds.add(String(result.id));
 
-        offerId = inserted.rows[0].id;
+      if (result.status === "new") stats.newOffers++;
+      if (result.status === "changed") stats.priceChanges++;
+      if (result.status === "unchanged") stats.unchangedOffers++;
+    }
 
-        changed = true;
-        stats.newOffers++;
-      }
+    // Saved listings the stores no longer show keep their
+    // last price but are flagged, so they are never
+    // presented as a current price.
 
-      // RECORD ONLY NEW OR CHANGED PRICES
+    const gone = free
+      .filter(row => row.availability !== store.INACTIVE)
+      .map(row => row.id);
 
-      if (changed) {
-        await client.query(
-          `
-          INSERT INTO public.price_history
-            (offer_id, price, currency)
-          VALUES ($1, $2, $3)
-          `,
-          [
-            offerId,
-            offer.amount,
-            offer.currency
-          ]
-        );
-      }
+    if (gone.length) {
+      await client.query(
+        `
+        UPDATE public.offers
+        SET availability = $2
+        WHERE id = ANY($1::bigint[])
+        `,
+        [gone, store.INACTIVE]
+      );
+
+      stats.noLongerListed = gone.length;
     }
 
     await client.query("COMMIT");
@@ -632,7 +589,7 @@ async function performTracking(
 
   return {
     productId,
-    offers: liveOffers,
+    offers: await store.readOffers(productId, liveIds),
     history: await getProductHistory(productId),
     stats,
     warning: "",
@@ -667,14 +624,17 @@ async function trackProduct(product, categorySlug) {
 
   // Respect cooldown before contacting the provider.
 
-  if (Date.now() < blockedUntil) {
-    const seconds = Math.ceil(
-      (blockedUntil - Date.now()) / 1000
-    );
+  const remaining = Math.max(
+    Math.ceil((blockedUntil - Date.now()) / 1000),
+    electronics.rateLimitRemaining
+      ? electronics.rateLimitRemaining()
+      : 0
+  );
 
+  if (remaining > 0) {
     return savedSnapshot(
       externalId,
-      `Live prices are temporarily rate limited. Retry in ${seconds} seconds.`
+      `Live prices are temporarily rate limited. Retry in ${remaining} seconds.`
     );
   }
 
